@@ -46,11 +46,11 @@ fn main() -> OpenCVResult<()> {
 
     let mut video_database: HashMap<i64, VideoFingerprint> = HashMap::new();
 
-    let video_path = "/home/harshmahajan/Downloads/yral.mp4";
+    let video_path = "/home/harshmahajan/Downloads/yral_ori.mp4";
     let fingerprint = process_video(video_path)?;
     add_video_to_database(&mut index, &mut video_database, fingerprint);
 
-    let search_video_path = "/home/harshmahajan/yral_tilt.mp4";
+    let search_video_path = "/home/harshmahajan/yral1.mp4";
     let search_fingerprint = process_video(search_video_path)?;
     search_similar_videos(&mut index, &video_database, &search_fingerprint);
 
@@ -215,6 +215,8 @@ fn search_similar_videos(
     let k = 20;
     let vector_threshold = 0.4f64;
     let hamming_threshold = 0.5f64;
+    
+    // Track matches for both methods
     let mut vector_matches = HashMap::new();
     let mut hamming_matches = HashMap::new();
 
@@ -229,58 +231,50 @@ fn search_similar_videos(
 
         for (i, label) in result.labels.iter().enumerate() {
             let distance = result.distances[i] as f64;
-            let vector_similarity = (-distance/64.0).exp();
+            let vector_similarity = (-distance/64.0).exp(); // Cosine similarity conversion
 
             if vector_similarity >= vector_threshold {
                 if let Some(id) = label.get() {
                     let video_id = (id % database.len() as u64) as i64;
                     let db_scene_idx = (id / database.len() as u64) as usize;
                     
-                    if let Some(video) = database.get(&video_id) {
-                        let match_entry = vector_matches
-                            .entry(video_id)
-                            .or_insert_with(|| VectorMatchResult {
-                                video_id,
-                                uuid: video.id.clone(),
-                                similarity: 0.0,
-                                matching_scenes: Vec::new(),
-                            });
-                        
-                        // Store both search and database scene indices
-                        match_entry.matching_scenes.push((
-                            search_scene_idx,
-                            db_scene_idx,
-                            vector_similarity
-                        ));
-                    }
+                    vector_matches
+                        .entry(video_id)
+                        .or_insert_with(VectorMatchResult::new)
+                        .add_match(search_scene_idx, db_scene_idx, vector_similarity);
                 }
             }
         }
     }
 
-    // Hamming distance comparison
-    for (search_scene_idx, &search_hash) in search_fingerprint.binary_hashes.iter().enumerate() {
-        for (&video_id, video) in database.iter() {
-            for (db_scene_idx, &db_hash) in video.binary_hashes.iter().enumerate() {
-                let hamming_dist = calculate_hamming_distance(search_hash, db_hash);
-                let hamming_similarity = 1.0 - (hamming_dist as f64 / 64.0);
+    // Hamming distance search using multi-index hashing
+    for (search_scene_idx, search_hash) in search_fingerprint.binary_hashes.iter().enumerate() {
+        // Split hash into 4 parts for multi-index search
+        let hash_parts = split_hash(search_hash);
+        
+        for (video_id, db_fingerprint) in database {
+            for (db_scene_idx, db_hash) in db_fingerprint.binary_hashes.iter().enumerate() {
+                let db_hash_parts = split_hash(db_hash);
+                
+                // Check if any part matches exactly (pigeonhole principle)
+                let mut has_matching_part = false;
+                for i in 0..4 {
+                    if hash_parts[i] == db_hash_parts[i] {
+                        has_matching_part = true;
+                        break;
+                    }
+                }
 
-                if hamming_similarity >= hamming_threshold {
-                    let match_entry = hamming_matches
-                        .entry(video_id)
-                        .or_insert_with(|| HammingMatchResult {
-                            video_id,
-                            uuid: video.id.clone(),
-                            similarity: 0.0,
-                            matching_scenes: Vec::new(),
-                        });
+                if has_matching_part {
+                    // Calculate full Hamming distance only for candidates
+                    let hamming_similarity = 1.0 - (hamming_distance(search_hash, db_hash) as f64 / 64.0);
                     
-                    // Store both search and database scene indices
-                    match_entry.matching_scenes.push((
-                        search_scene_idx,
-                        db_scene_idx,
-                        hamming_similarity
-                    ));
+                    if hamming_similarity >= hamming_threshold {
+                        hamming_matches
+                            .entry(*video_id)
+                            .or_insert_with(HammingMatchResult::new)
+                            .add_match(search_scene_idx, db_scene_idx, hamming_similarity);
+                    }
                 }
             }
         }
@@ -370,5 +364,57 @@ fn search_similar_videos(
             }
             println!("-------------------------");
         }
+    }
+}
+
+// Helper functions
+fn split_hash(hash: &u64) -> [u16; 4] {
+    [
+        ((hash >> 48) & 0xFFFF) as u16,
+        ((hash >> 32) & 0xFFFF) as u16,
+        ((hash >> 16) & 0xFFFF) as u16,
+        (hash & 0xFFFF) as u16
+    ]
+}
+
+fn hamming_distance(a: &u64, b: &u64) -> u32 {
+    (a ^ b).count_ones()
+}
+
+impl VectorMatchResult {
+    fn new() -> Self {
+        Self {
+            video_id: 0,
+            uuid: String::new(),
+            similarity: 0.0,
+            matching_scenes: Vec::new()
+        }
+    }
+
+    fn add_match(&mut self, search_idx: usize, db_idx: usize, similarity: f64) {
+        self.matching_scenes.push((search_idx, db_idx, similarity));
+        // Update overall similarity as average
+        self.similarity = self.matching_scenes.iter()
+            .map(|(_, _, sim)| sim)
+            .sum::<f64>() / self.matching_scenes.len() as f64;
+    }
+}
+
+impl HammingMatchResult {
+    fn new() -> Self {
+        Self {
+            video_id: 0,
+            uuid: String::new(),
+            similarity: 0.0,
+            matching_scenes: Vec::new()
+        }
+    }
+
+    fn add_match(&mut self, search_idx: usize, db_idx: usize, similarity: f64) {
+        self.matching_scenes.push((search_idx, db_idx, similarity));
+        // Update overall similarity as average
+        self.similarity = self.matching_scenes.iter()
+            .map(|(_, _, sim)| sim)
+            .sum::<f64>() / self.matching_scenes.len() as f64;
     }
 }
